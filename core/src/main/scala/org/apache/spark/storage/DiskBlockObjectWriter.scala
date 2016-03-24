@@ -42,7 +42,7 @@ private[spark] class DiskBlockObjectWriter(
     syncWrites: Boolean,
     // These write metrics concurrently shared with other active DiskBlockObjectWriters who
     // are themselves performing writes. All updates must be relative.
-    writeMetrics: ShuffleWriteMetrics)
+    var writeMetrics: ShuffleWriteMetrics)
   extends OutputStream
   with Logging {
 
@@ -71,9 +71,16 @@ private[spark] class DiskBlockObjectWriter(
    * -----: Current writes to the underlying file.
    * xxxxx: Existing contents of the file.
    */
-  private val initialPosition = file.length()
+  private var initialPosition: Long = 0
   private var finalPosition: Long = -1
-  private var reportedPosition = initialPosition
+  private var reportedPosition: Long = 0
+
+  /**
+   * Keep track of number of records written and also use this to periodically
+   * output bytes written since the latter is expensive to do for each record.
+   */
+  private var oldinitialPosition: Long = -1
+  private var oldfinalPosition: Long = -1
 
   /**
    * Keep track of number of records written and also use this to periodically
@@ -85,6 +92,10 @@ private[spark] class DiskBlockObjectWriter(
     if (hasBeenClosed) {
       throw new IllegalStateException("Writer already closed. Cannot be reopened.")
     }
+    oldinitialPosition = -1
+    oldfinalPosition = -1
+    initialPosition = file.length()
+    reportedPosition = initialPosition
     fos = new FileOutputStream(file, true)
     ts = new TimeTrackingOutputStream(writeMetrics, fos)
     channel = fos.getChannel()
@@ -125,18 +136,62 @@ private[spark] class DiskBlockObjectWriter(
    */
   def commitAndClose(): Unit = {
     if (initialized) {
+      Utils.tryWithSafeFinally {
+        if (syncWrites) {
+          // Force outstanding writes to disk and track how long it takes
+          objOut.flush()
+          val start = System.nanoTime()
+          fos.getFD.sync()
+          writeMetrics.incShuffleWriteTime(System.nanoTime() - start)
+        }
+      }
       // NOTE: Because Kryo doesn't flush the underlying stream we explicitly flush both the
       //       serializer stream and the lower level stream.
       objOut.flush()
       bs.flush()
-      close()
-      finalPosition = file.length()
+      updateBytesWritten()
+      finalPosition = reportedPosition
       // In certain compression codecs, more bytes are written after close() is called
       writeMetrics.incShuffleBytesWritten(finalPosition - reportedPosition)
-    } else {
-      finalPosition = file.length()
     }
+
+    /** record the parameters about the finished shuffle data*/
+    oldinitialPosition = initialPosition
+    oldfinalPosition = finalPosition
+
+    /** Initialize the parameters for the next use*/
+    initialPosition = finalPosition
+    finalPosition= -1
+    reportedPosition = initialPosition
+    numRecordsWritten = 0
     commitAndCloseHasBeenCalled = true
+  }
+
+  /**
+   * Flush the partial writes and commit them as a single atomic block.
+   * The operation process is the same with the original commitAndClose function.
+   */
+   def realClose(): Unit = {
+     if (initialized) {
+       // NOTE: Because Kryo doesn't flush the underlying stream we explicitly flush both the
+       //       serializer stream and the lower level stream.
+       objOut.flush()
+       bs.flush()
+       close()
+       finalPosition = file.length()
+       // In certain compression codecs, more bytes are written after close() is called
+       writeMetrics.incShuffleBytesWritten(finalPosition - reportedPosition)
+     } else {
+       finalPosition = file.length()
+     }
+
+     /** record the parameters about the finished shuffle data*/
+     oldinitialPosition = initialPosition
+     oldfinalPosition = finalPosition
+
+     /** Initialize the parameters for the next use*/
+     numRecordsWritten = 0
+     commitAndCloseHasBeenCalled = true
   }
 
 
@@ -154,14 +209,24 @@ private[spark] class DiskBlockObjectWriter(
         writeMetrics.decShuffleRecordsWritten(numRecordsWritten)
         objOut.flush()
         bs.flush()
-        close()
+        Utils.tryWithSafeFinally {
+          if (syncWrites) {
+            // Force outstanding writes to disk and track how long it takes
+            objOut.flush()
+            val start = System.nanoTime()
+            fos.getFD.sync()
+            writeMetrics.incShuffleWriteTime(System.nanoTime() - start)
+          }
+        }
       }
 
-      val truncateStream = new FileOutputStream(file, true)
       try {
-        truncateStream.getChannel.truncate(initialPosition)
+        channel.truncate(initialPosition)
       } finally {
-        truncateStream.close()
+        finalPosition= -1
+        reportedPosition = initialPosition
+        numRecordsWritten = 0
+        commitAndCloseHasBeenCalled = true
       }
     } catch {
       case e: Exception =>
@@ -213,7 +278,8 @@ private[spark] class DiskBlockObjectWriter(
       throw new IllegalStateException(
         "fileSegment() is only valid after commitAndClose() has been called")
     }
-    new FileSegment(file, initialPosition, finalPosition - initialPosition)
+    commitAndCloseHasBeenCalled = false
+    new FileSegment(file, oldinitialPosition, oldfinalPosition - oldinitialPosition)
   }
 
   /**
@@ -226,9 +292,18 @@ private[spark] class DiskBlockObjectWriter(
     reportedPosition = pos
   }
 
+
   // For testing
   private[spark] override def flush() {
     objOut.flush()
     bs.flush()
+  }
+
+  /**
+   * reset the writer's shuffle write metrics.
+   * Note that this is only used on the improved shuffle file consolidation.
+   */
+  def setShuffleWriteMetrics(writeMetricsRef: ShuffleWriteMetrics){
+    writeMetrics = writeMetricsRef
   }
 }

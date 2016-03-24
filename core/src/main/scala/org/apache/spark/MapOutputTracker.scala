@@ -451,8 +451,9 @@ private[spark] object MapOutputTracker extends Logging {
       shuffleId: Int,
       reduceId: Int,
       statuses: Array[MapStatus]): Seq[(BlockManagerId, Seq[(BlockId, Long)])] = {
-    assert (statuses != null)
-    val splitsByAddress = new HashMap[BlockManagerId, ArrayBuffer[(BlockId, Long)]]
+    assert(statuses != null)
+    val splitsByAddress = new HashMap[BlockManagerId, ArrayBuffer[(Int, Int, Long)]]
+    val consolidateShuffleFiles = SparkEnv.get.blockManager.conf.getBoolean("spark.shuffle.consolidateFiles", false)
     for ((status, mapId) <- statuses.zipWithIndex) {
       if (status == null) {
         val errorMessage = s"Missing an output location for shuffle $shuffleId"
@@ -460,10 +461,43 @@ private[spark] object MapOutputTracker extends Logging {
         throw new MetadataFetchFailedException(shuffleId, reduceId, errorMessage)
       } else {
         splitsByAddress.getOrElseUpdate(status.location, ArrayBuffer()) +=
-          ((ShuffleBlockId(shuffleId, mapId, reduceId), status.getSizeForBlock(reduceId)))
+          ((mapId, status.getFileGroupID, status.getSizeForBlock(reduceId)))
       }
     }
 
-    splitsByAddress.toSeq
+    val splitsByAddressAndFileGroupID: Seq[(BlockManagerId, Seq[(BlockId, Long)])] =
+      if (consolidateShuffleFiles) {
+        /**
+         * On the improved shuffle file consolidation, shuffle fetching needs some changes.
+         * MapId is changed to fileGroupId. So the total size is the sum size of the map output with the same fileGroupId.
+         **/
+          splitsByAddress.toSeq.map {
+            case (location, splits) => {
+              val splitsByFileGroupID = new HashMap[Int, Long]
+              splits.map(s => {
+                val (mapId, fileGroupID, size) = s
+                splitsByFileGroupID.getOrElseUpdate(fileGroupID, 0l) +=  size
+              })
+              (location, splitsByFileGroupID.toSeq.map( s => {
+                val (fileGroupID, totalSize) = s
+                (ShuffleBlockId(shuffleId, fileGroupID, reduceId), totalSize)
+              }))
+            }
+          }
+      }
+      else {
+        /**
+         * Nothing is changed.
+         **/
+          splitsByAddress.toSeq.map {
+            case (location, splits) =>
+              (location, splits.map(s => {
+                val (mapId, fileGroupID, size) = s
+                (ShuffleBlockId(shuffleId, mapId, reduceId), size)
+              }))
+          }
+      }
+
+    splitsByAddressAndFileGroupID
   }
 }

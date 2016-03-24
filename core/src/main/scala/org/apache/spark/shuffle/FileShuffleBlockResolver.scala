@@ -36,7 +36,8 @@ import org.apache.spark.{Logging, SparkConf, SparkEnv}
 /** A group of writers for a ShuffleMapTask, one writer per reducer. */
 private[spark] trait ShuffleWriterGroup {
   val writers: Array[DiskBlockObjectWriter]
-
+  /** fileId for shuffle fetching on the improved shuffle file consolidation*/
+  val fileGroupID: Int
   /** @param success Indicates all writes were successful. If false, no blocks will be recorded. */
   def releaseWriters(success: Boolean)
 }
@@ -114,12 +115,18 @@ private[spark] class FileShuffleBlockResolver(conf: SparkConf)
       val openStartTime = System.nanoTime
       val serializerInstance = serializer.newInstance()
       val writers: Array[DiskBlockObjectWriter] = if (consolidateShuffleFiles) {
+        /**
+         * On the improved shuffle file consolidation, shuffle files are open and closed once.
+         * So reusing the file handles could reduce the creation of lots of java objects
+         * */
         fileGroup = getUnusedFileGroup()
-        Array.tabulate[DiskBlockObjectWriter](numBuckets) { bucketId =>
-          val blockId = ShuffleBlockId(shuffleId, mapId, bucketId)
-          blockManager.getDiskWriter(blockId, fileGroup(bucketId), serializerInstance, bufferSize,
-            writeMetrics)
+        /**
+         * reset the writer's shuffle write metrics.
+         * */
+        for (i <- 0 until  fileGroup.writers.length) {
+          fileGroup.writers(i).setShuffleWriteMetrics(writeMetrics)
         }
+        fileGroup.writers
       } else {
         Array.tabulate[DiskBlockObjectWriter](numBuckets) { bucketId =>
           val blockId = ShuffleBlockId(shuffleId, mapId, bucketId)
@@ -131,6 +138,12 @@ private[spark] class FileShuffleBlockResolver(conf: SparkConf)
       // Creating the file to write to and creating a disk writer both involve interacting with
       // the disk, so should be included in the shuffle write time.
       writeMetrics.incShuffleWriteTime(System.nanoTime - openStartTime)
+
+      /**
+       * On the improved shuffle file consolidation, fileGroupID is the fileId of fileGroup.
+       * Otherwise, -1.
+       * */
+      val fileGroupID:Int= if(consolidateShuffleFiles) fileGroup.fileId else -1
 
       override def releaseWriters(success: Boolean) {
         if (consolidateShuffleFiles) {
@@ -156,7 +169,12 @@ private[spark] class FileShuffleBlockResolver(conf: SparkConf)
           val filename = physicalFileName(shuffleId, bucketId, fileId)
           blockManager.diskBlockManager.getFile(filename)
         }
-        val fileGroup = new ShuffleFileGroup(shuffleId, fileId, files)
+        val writers: Array[DiskBlockObjectWriter] =Array.tabulate[DiskBlockObjectWriter](numBuckets) { bucketId =>
+          val blockId = ShuffleBlockId(shuffleId, mapId, bucketId)
+          blockManager.getDiskWriter(blockId, files(bucketId), serializerInstance, bufferSize,
+            writeMetrics)
+        }
+        val fileGroup = new ShuffleFileGroup(shuffleId, fileId, files, writers)
         shuffleState.allFileGroups.add(fileGroup)
         fileGroup
       }
@@ -235,8 +253,9 @@ private[spark] object FileShuffleBlockResolver {
   /**
    * A group of shuffle files, one per reducer.
    * A particular mapper will be assigned a single ShuffleFileGroup to write its output to.
+   * On the improved shuffle file consolidation, shuffle writes are stored for reusing
    */
-  private class ShuffleFileGroup(val shuffleId: Int, val fileId: Int, val files: Array[File]) {
+  private class ShuffleFileGroup(val shuffleId: Int, val fileId: Int, val files: Array[File], val writers: Array[DiskBlockObjectWriter]) {
     private var numBlocks: Int = 0
 
     /**
@@ -270,16 +289,19 @@ private[spark] object FileShuffleBlockResolver {
       }
     }
 
-    /** Returns the FileSegment associated with the given map task, or None if no entry exists. */
+    /**
+     * On the improved shuffle file consolidation, the entire file is fetched.
+     * Because the data of file are belonged to the same partition and can be fetched at the same time
+     * Node: mapId is actually fileId. shuffle files are closed before shuffle fetching
+     */
     def getFileSegmentFor(mapId: Int, reducerId: Int): Option[FileSegment] = {
       val file = files(reducerId)
-      val blockOffsets = blockOffsetsByReducer(reducerId)
-      val blockLengths = blockLengthsByReducer(reducerId)
-      val index = mapIdToIndex.getOrElse(mapId, -1)
-      if (index >= 0) {
-        val offset = blockOffsets(index)
-        val length = blockLengths(index)
-        Some(new FileSegment(file, offset, length))
+      if (mapId == fileId) {
+        if(writers(reducerId) != null && writers(reducerId).isOpen) {
+           writers(reducerId).realClose()
+           writers(reducerId) = null
+        }
+        Some(new FileSegment(file, 0, file.length()))
       } else {
         None
       }

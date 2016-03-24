@@ -104,8 +104,14 @@ private[spark] class HashShuffleWriter[K, V](
 
   private def commitWritesAndBuildStatus(): MapStatus = {
     // Commit the writes. Get the size of each bucket block (total block size).
+    /**
+     * On the improved shuffle file consolidation, call the commitAndClose function that has changed.
+     * */
     val sizes: Array[Long] = shuffle.writers.map { writer: DiskBlockObjectWriter =>
-      writer.commitAndClose()
+      if(shuffleBlockResolver.consolidateShuffleFiles)
+         writer.commitAndClose()
+      else
+         writer.realClose()
       writer.fileSegment().length
     }
     if (!shuffleBlockResolver.consolidateShuffleFiles) {
@@ -133,7 +139,7 @@ private[spark] class HashShuffleWriter[K, V](
         }
       }
     }
-    MapStatus(blockManager.shuffleServerId, sizes)
+    MapStatus(blockManager.shuffleServerId, shuffle.fileGroupID, sizes)
   }
 
   private def revertWrites(): Unit = {
