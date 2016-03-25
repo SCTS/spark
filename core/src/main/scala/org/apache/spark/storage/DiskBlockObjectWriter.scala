@@ -144,6 +144,8 @@ private[spark] class DiskBlockObjectWriter(
           fos.getFD.sync()
           writeMetrics.incShuffleWriteTime(System.nanoTime() - start)
         }
+      }{
+        //nothing
       }
       // NOTE: Because Kryo doesn't flush the underlying stream we explicitly flush both the
       //       serializer stream and the lower level stream.
@@ -217,6 +219,8 @@ private[spark] class DiskBlockObjectWriter(
             fos.getFD.sync()
             writeMetrics.incShuffleWriteTime(System.nanoTime() - start)
           }
+        }{
+          //nothing
         }
       }
 

@@ -476,7 +476,10 @@ private[spark] object MapOutputTracker extends Logging {
               val splitsByFileGroupID = new HashMap[Int, Long]
               splits.map(s => {
                 val (mapId, fileGroupID, size) = s
-                splitsByFileGroupID.getOrElseUpdate(fileGroupID, 0l) +=  size
+                if(splitsByFileGroupID.contains(fileGroupID))
+                   splitsByFileGroupID(fileGroupID) += size
+                else
+                   splitsByFileGroupID += ((fileGroupID, size))
               })
               (location, splitsByFileGroupID.toSeq.map( s => {
                 val (fileGroupID, totalSize) = s
