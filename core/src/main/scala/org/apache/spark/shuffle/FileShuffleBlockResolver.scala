@@ -298,7 +298,7 @@ private[spark] object FileShuffleBlockResolver {
       val file = files(reducerId)
       if (mapId == fileId) {
         if(writers(reducerId) != null && writers(reducerId).isOpen) {
-           writers(reducerId).realClose()
+           writers(reducerId).commitAndClose()
            writers(reducerId) = null
         }
         Some(new FileSegment(file, 0, file.length()))

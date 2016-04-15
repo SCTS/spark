@@ -134,7 +134,7 @@ private[spark] class DiskBlockObjectWriter(
   /**
    * Flush the partial writes and commit them as a single atomic block.
    */
-  def commitAndClose(): Unit = {
+  def realClose(): Unit = {
     if (initialized) {
       Utils.tryWithSafeFinally {
         if (syncWrites) {
@@ -173,7 +173,7 @@ private[spark] class DiskBlockObjectWriter(
    * Flush the partial writes and commit them as a single atomic block.
    * The operation process is the same with the original commitAndClose function.
    */
-   def realClose(): Unit = {
+   def commitAndClose(): Unit = {
      if (initialized) {
        // NOTE: Because Kryo doesn't flush the underlying stream we explicitly flush both the
        //       serializer stream and the lower level stream.
