@@ -109,7 +109,7 @@ private[spark] class HashShuffleWriter[K, V](
      * */
     val sizes: Array[Long] = shuffle.writers.map { writer: DiskBlockObjectWriter =>
       if(shuffleBlockResolver.consolidateShuffleFiles)
-         writer.realClose()
+         writer.fakeClose()
       else
          writer.commitAndClose()
       writer.fileSegment().length

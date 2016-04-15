@@ -134,7 +134,7 @@ private[spark] class DiskBlockObjectWriter(
   /**
    * Flush the partial writes and commit them as a single atomic block.
    */
-  def realClose(): Unit = {
+  def fakeClose(): Unit = {
     if (initialized) {
       Utils.tryWithSafeFinally {
         if (syncWrites) {
